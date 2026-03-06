@@ -1,6 +1,7 @@
 # Clippying StreamController Plugin
 
 This is a StreamController plugin that provides a single action to control the `clippying` Rust daemon via its WebSocket JSON API.
+The plugin includes a Rust binding layer (`clippying_native`) that embeds and hosts the Rust side from `_native.abi3.so`.
 
 ## Actions
 
@@ -14,11 +15,31 @@ This is a StreamController plugin that provides a single action to control the `
 ## Requirements
 
 - StreamController >= `1.5.0-beta.12`
-- `clippying` binary available on `PATH` (or set the per-action setting **Clippying binary**)
 - Python dependency: `websocket-client` (see `requirements.txt`)
 - For long-press playback: `paplay` or `aplay` available on the system
+- For building bindings: Rust toolchain (`cargo`)
+
+## Build
+
+Build Rust bindings and place them in the plugin package:
+
+```bash
+./build.sh release
+```
+
+Dev build:
+
+```bash
+./build.sh dev
+```
+
+Clean build artifacts:
+
+```bash
+./build.sh clean
+```
 
 ## Notes
 
 - WebSocket URL defaults to `ws://127.0.0.1:17373`.
-- The per-action configuration screen lets you set the WebSocket URL and `clippying` binary path.
+- The plugin continuously heartbeats the API and will attempt to become host if it disappears.

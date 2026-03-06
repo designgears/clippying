@@ -32,6 +32,7 @@ const MANAGER_WS_PORT: u16 = 17373;
 const PID_FILE: &str = "/tmp/clippying.pid";
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+static MANAGER_THREAD_RUNNING: AtomicBool = AtomicBool::new(false);
 
 pub const LOG_FILE: &str = "/tmp/clippying.log";
 
@@ -292,6 +293,35 @@ pub fn daemonize_manager(exe_path: &str) {
         }
         Err(_) => eprintln!("Fork failed"),
     }
+}
+
+pub fn start_manager_in_thread(exe_path: &str) -> Result<(), String> {
+    if MANAGER_THREAD_RUNNING.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
+    let ws_listener = match bind_manager_listener() {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "failed to start (could not bind ws://127.0.0.1:{}): {}",
+                MANAGER_WS_PORT, e
+            ));
+        }
+    };
+
+    let exe = exe_path.to_string();
+    MANAGER_THREAD_RUNNING.store(true, Ordering::Relaxed);
+    thread::spawn(move || {
+        run_manager(&exe, ws_listener);
+        MANAGER_THREAD_RUNNING.store(false, Ordering::Relaxed);
+    });
+    Ok(())
+}
+
+pub fn stop_manager_in_thread() {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
 }
 
 fn redirect_stdio() {
@@ -703,4 +733,3 @@ fn clip_buffer(
         let _ = child.wait();
     });
 }
-

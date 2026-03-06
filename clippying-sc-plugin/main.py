@@ -19,7 +19,13 @@ from src.backend.PluginManager.ActionInputSupport import ActionInputSupport
 
 from src.Signals.Signals import AppQuit
 
-from actions import ClippyingClipButtonAction, ClippyingWsClient, stop_daemon_best_effort
+from actions import (
+    ClippyingClipButtonAction,
+    ClippyingWsClient,
+    start_host_manager,
+    stop_daemon_best_effort,
+    stop_host_manager,
+)
 
 
 class Clippying(PluginBase):
@@ -56,9 +62,10 @@ class Clippying(PluginBase):
         )
 
     def on_enable(self):
-        pass
+        start_host_manager()
 
     def on_disable(self):
+        stop_host_manager()
         if self._stop_daemon_on_quit_enabled():
             stop_daemon_best_effort()
 
@@ -78,6 +85,7 @@ class Clippying(PluginBase):
         self.set_settings(settings)
 
     def _on_app_quit(self, *_args, **_kwargs) -> None:
+        stop_host_manager()
         if self._stop_daemon_on_quit_enabled():
             stop_daemon_best_effort()
 

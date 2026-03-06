@@ -5,7 +5,6 @@
 **/__pycache__/
 **/*.py[cod]
 **/*.pyd
-**/*.so
 **/.venv/
 **/venv/
 **/.pytest_cache/

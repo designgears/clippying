@@ -23,12 +23,24 @@ from src.backend.DeckManagement.InputIdentifier import Input
 from src.backend.PluginManager.EventAssigner import EventAssigner
 from src.windows.Settings.PluginSettingsWindow.PluginSettingsWindow import PluginSettingsWindow
 
+try:
+    from clippying_native import api_is_up as _native_api_is_up
+    from clippying_native import ensure_api as _native_ensure_api
+    from clippying_native import stop_api as _native_stop_api
+    _NATIVE_BINDINGS_AVAILABLE = True
+except Exception:
+    _NATIVE_BINDINGS_AVAILABLE = False
+
 
 _ACTIVE_ACTIONS: "weakref.WeakSet[ClippyingClipButtonAction]" = weakref.WeakSet()
 _ACTIVE_ACTIONS_LOCK = threading.Lock()
+_DEFAULT_WS_URL = "ws://127.0.0.1:17373"
+_DEFAULT_CLIPPYING_EXE = "__embedded__"
 
 
 def _run_clippying(exe: str, args: list[str]) -> tuple[bool, str]:
+    if not exe:
+        return False, "empty executable path"
     try:
         p = subprocess.run(
             [exe, *args],
@@ -46,6 +58,12 @@ def _run_clippying(exe: str, args: list[str]) -> tuple[bool, str]:
 
 
 def _ws_is_up(url: str) -> bool:
+    if _NATIVE_BINDINGS_AVAILABLE:
+        try:
+            return bool(_native_api_is_up(url))
+        except Exception:
+            return False
+
     try:
         import websocket  # type: ignore
     except Exception:
@@ -66,12 +84,130 @@ _DAEMON_STOP_LOCK = threading.Lock()
 _DAEMON_STOP_REQUESTED = False
 
 
+class _DaemonHostManager:
+    """Keeps the local API hosted and fails over when it disappears."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_failure_log_at: dict[str, float] = {}
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True, name="clippying-host-manager")
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        t = None
+        with self._lock:
+            t = self._thread
+            self._thread = None
+        if t:
+            t.join(timeout=1.0)
+
+    def ensure_now(self, url: str, exe: str) -> bool:
+        self.start()
+        return self._ensure_running(url, exe, log_on_failure=True)
+
+    def _targets(self) -> list[tuple[str, str]]:
+        with _ACTIVE_ACTIONS_LOCK:
+            actions = list(_ACTIVE_ACTIONS)
+
+        targets: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for action in actions:
+            try:
+                url = action._ws_url()
+            except Exception:
+                url = _DEFAULT_WS_URL
+            try:
+                exe = action._clippying_exe()
+            except Exception:
+                exe = _DEFAULT_CLIPPYING_EXE
+
+            key = ((url or _DEFAULT_WS_URL).strip() or _DEFAULT_WS_URL, (exe or _DEFAULT_CLIPPYING_EXE).strip() or _DEFAULT_CLIPPYING_EXE)
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append(key)
+
+        if not targets:
+            targets.append((_DEFAULT_WS_URL, _DEFAULT_CLIPPYING_EXE))
+        return targets
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            for url, exe in self._targets():
+                if self._stop.is_set():
+                    return
+                self._ensure_running(url, exe, log_on_failure=False)
+            self._stop.wait(2.0)
+
+    def _ensure_running(self, url: str, exe: str, log_on_failure: bool) -> bool:
+        ws_url = (url or _DEFAULT_WS_URL).strip() or _DEFAULT_WS_URL
+        binary = (exe or _DEFAULT_CLIPPYING_EXE).strip() or _DEFAULT_CLIPPYING_EXE
+
+        ok = False
+        msg = ""
+        if _NATIVE_BINDINGS_AVAILABLE:
+            try:
+                ok = bool(_native_ensure_api(ws_url, binary, 3000))
+            except Exception as e:
+                msg = str(e)
+        else:
+            # Start-first strategy. If port is already in use, daemon reports already running.
+            if not log_on_failure and _ws_is_up(ws_url):
+                return True
+            ok, msg = _run_clippying(binary, ["start"])
+            if ok:
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    if self._stop.is_set():
+                        return False
+                    if _ws_is_up(ws_url):
+                        return True
+                    time.sleep(0.1)
+
+        if ok:
+            return True
+
+        if log_on_failure:
+            log.error(f"daemon not reachable at {ws_url}")
+        else:
+            now = time.time()
+            last = self._last_failure_log_at.get(ws_url, 0.0)
+            if now - last >= 10.0:
+                detail = msg if msg else "no response"
+                log.warning(f"daemon heartbeat failed at {ws_url}; host attempt result: {detail}")
+                self._last_failure_log_at[ws_url] = now
+        return False
+
+
+_HOST_MANAGER = _DaemonHostManager()
+
+
+def start_host_manager() -> None:
+    _HOST_MANAGER.start()
+
+
+def stop_host_manager() -> None:
+    _HOST_MANAGER.stop()
+
+
 def stop_daemon_best_effort(exe: str | None = None) -> None:
     global _DAEMON_STOP_REQUESTED
     with _DAEMON_STOP_LOCK:
         if _DAEMON_STOP_REQUESTED:
             return
         _DAEMON_STOP_REQUESTED = True
+
+    # Stop auto-hosting before requesting daemon shutdown.
+    _HOST_MANAGER.stop()
 
     try:
         if not exe:
@@ -86,8 +222,11 @@ def stop_daemon_best_effort(exe: str | None = None) -> None:
                 if exe:
                     break
 
-        exe = (exe or "clippying").strip()
-        ok, msg = _run_clippying(exe, ["stop"])
+        exe = (exe or _DEFAULT_CLIPPYING_EXE).strip()
+        if _NATIVE_BINDINGS_AVAILABLE:
+            ok, msg = _native_stop_api(exe)
+        else:
+            ok, msg = _run_clippying(exe, ["stop"])
         if not ok:
             log.error(f"failed to stop daemon: {msg}")
     except Exception as e:
@@ -269,6 +408,7 @@ class ClippyingClipButtonAction(ActionBase):
         self.settings = self.get_settings() or {}
         with _ACTIVE_ACTIONS_LOCK:
             _ACTIVE_ACTIONS.add(self)
+        start_host_manager()
         self._ensure_listener()
         self._ensure_monitoring()
         self._refresh_labels_from_settings()
@@ -286,36 +426,38 @@ class ClippyingClipButtonAction(ActionBase):
 
     def event_callback(self, event, data=None):
         event_str = str(event)
-        log.error(f"ClippyingClipButtonAction event_callback: event={event_str} data={data}")
+        # StreamController emits several key events; only two are actionable here.
+        if event_str not in ("Key Short Up", "Key Hold Start"):
+            return
 
         if event_str == "Key Short Up":
             mode = self.settings.get("playback_mode", "play-stop")
             if self._player.is_playing():
                 if mode == "play-stop":
-                    log.error("ClippyingClipButtonAction -> STOP PLAYBACK")
+                    log.debug("ClippyingClipButtonAction -> STOP PLAYBACK")
                     self._player.stop()
                 elif mode == "play-restart":
-                    log.error("ClippyingClipButtonAction -> RESTART PLAYBACK")
+                    log.debug("ClippyingClipButtonAction -> RESTART PLAYBACK")
                     self._play_last_clip()
                 elif mode == "play-overlap":
-                    log.error("ClippyingClipButtonAction -> OVERLAP PLAYBACK")
+                    log.debug("ClippyingClipButtonAction -> OVERLAP PLAYBACK")
                     self._play_last_clip_overlap()
             else:
-                log.error("ClippyingClipButtonAction -> PLAY CLIP")
+                log.debug("ClippyingClipButtonAction -> PLAY CLIP")
                 self._play_last_clip()
         elif event_str == "Key Hold Start":
-            log.error("ClippyingClipButtonAction -> TRIGGER CLIPPING")
+            log.debug("ClippyingClipButtonAction -> TRIGGER CLIPPING")
             self._trigger_clip()
 
 
     def _ws_url(self) -> str:
-        return (self.settings.get("ws_url") or "ws://127.0.0.1:17373").strip() or "ws://127.0.0.1:17373"
+        return (self.settings.get("ws_url") or _DEFAULT_WS_URL).strip() or _DEFAULT_WS_URL
 
     def _clippying_exe(self) -> str:
         return (
             self.settings.get("clippying_exe")
-            or "clippying"
-        ).strip() or "clippying"
+            or _DEFAULT_CLIPPYING_EXE
+        ).strip() or _DEFAULT_CLIPPYING_EXE
 
     def _ws(self) -> ClippyingWsClient:
         return ClippyingWsClient(self._ws_url())
@@ -349,19 +491,8 @@ class ClippyingClipButtonAction(ActionBase):
 
     def _ensure_daemon_running(self) -> bool:
         url = self._ws_url()
-        if _ws_is_up(url):
-            return True
-
-        ok, msg = _run_clippying(self._clippying_exe(), ["start"])
-        if not ok:
-            log.error(f"failed to start daemon: {msg}")
-            return False
-
-        for _ in range(30):
-            if _ws_is_up(url):
-                return True
-            time.sleep(0.1)
-        return False
+        exe = self._clippying_exe()
+        return _HOST_MANAGER.ensure_now(url, exe)
 
     def _ensure_listener(self):
         if self._listener is not None:
@@ -666,8 +797,13 @@ class ClippyingClipButtonAction(ActionBase):
     def _play_last_clip(self):
         path = (self.settings.get("last_clip_path") or "").strip()
         if not path:
+            log.debug("No last clip saved for this button yet")
             return
-        self._player.play(path, sink=self._selected_sink())
+        if not os.path.exists(path):
+            log.warning(f"Saved clip path no longer exists: {path}")
+            return
+        if not self._player.play(path, sink=self._selected_sink()):
+            log.warning("Failed to start playback (missing paplay/aplay or invalid clip)")
 
     def _play_last_clip_overlap(self):
         """Play clip without stopping current playback (fire and forget)."""

@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "clippying-native"
+version = "0.1.0"
+description = "Rust bindings for clippying plugin host management"
+requires-python = ">=3.11"
+
+[tool.maturin]
+module-name = "clippying_native._native"
+manifest-path = "rust-host/Cargo.toml"
