@@ -1,0 +1,251 @@
+import { Button, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+export component Trimmer inherits Window {
+    title: "Clippying Trimmer";
+    width: 850px;
+    height: 260px;
+    background: #1e1e1e;
+
+    // Callbacks to Rust
+    callback play-clicked();
+    callback stop-clicked();
+    callback save-clicked();
+    callback cancel-clicked();
+    callback selection-changed(float, float);
+    callback zoom-changed(float, float);  // zoom-level, view-offset
+
+    // Properties from Rust
+    in property <string> status: "Drop a WAV file or pass path as argument";
+    in property <string> time-display: "";
+    in-out property <float> zoom-level: 1.0;
+    in property <bool> is-playing: false;
+    in property <bool> has-selection: false;
+    in property <[float]> peaks: [];
+    in property <float> playhead-pos: -1.0;  // -1 = hidden
+    in property <float> view-start: 0.0;  // Start of visible range in audio-space
+    in property <float> view-end: 1.0;    // End of visible range in audio-space
+
+    // Internal selection state
+    in-out property <float> sel-start: 0.0;
+    in-out property <float> sel-end: 0.0;
+
+    // Zoom/pan state
+    in-out property <float> view-offset: 0.0;  // 0.0 to 1.0 - (1.0/zoom-level)
+    property <bool> is-panning: false;
+    property <float> pan-start-x: 0.0;
+    property <float> pan-start-offset: 0.0;
+    // Helper properties for scroll zoom calculation
+    property <float> scroll-mouse-norm: 0.0;
+    property <float> scroll-mouse-audio: 0.0;
+    property <float> scroll-new-zoom: 1.0;
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        // Waveform area
+        Rectangle {
+            height: 150px;
+            background: #1e1e1e;
+            border-radius: 0px;
+
+            // Waveform canvas
+            waveform := Rectangle {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                background: #1e1e1e;
+
+                // Center line
+                Rectangle {
+                    x: 0;
+                    y: parent.height / 2 - 0.5px;
+                    width: parent.width;
+                    height: 1px;
+                    background: #444444;
+                }
+
+                // Helper for audio-to-screen coordinate transform
+                property <float> view-range: max(0.0001, view-end - view-start);
+                function audio-to-screen(audio-pos: float) -> length {
+                    return (audio-pos - view-start) / view-range * self.width;
+                }
+
+                // Selection highlight (transform from audio-space to screen-space)
+                Rectangle {
+                    x: parent.audio-to-screen(min(sel-start, sel-end));
+                    y: 0;
+                    width: abs(sel-end - sel-start) / parent.view-range * parent.width;
+                    height: parent.height;
+                    background: #3a86ff50;
+                    visible: has-selection;
+                }
+
+                // Waveform bars - peaks are pre-computed for visible range
+                for peak[i] in peaks: Rectangle {
+                    property <float> bar-pos: i / peaks.length;  // 0-1 within visible range
+                    x: bar-pos * parent.width;
+                    y: parent.height / 2 - abs(peak) * parent.height / 2 * 0.9;
+                    width: max(1px, parent.width / peaks.length);
+                    height: max(1px, abs(peak) * parent.height * 0.9);
+                    background: #00ff88;
+                }
+
+                // Selection edges (transform from audio-space to screen-space)
+                Rectangle {
+                    x: parent.audio-to-screen(min(sel-start, sel-end)) - 1px;
+                    y: 0;
+                    width: 2px;
+                    height: parent.height;
+                    background: #3a86ff;
+                    visible: has-selection;
+                }
+                Rectangle {
+                    x: parent.audio-to-screen(max(sel-start, sel-end)) - 1px;
+                    y: 0;
+                    width: 2px;
+                    height: parent.height;
+                    background: #3a86ff;
+                    visible: has-selection;
+                }
+
+                // Playhead (transform from audio-space to screen-space)
+                Rectangle {
+                    x: parent.audio-to-screen(playhead-pos) - 1px;
+                    y: 0;
+                    width: 2px;
+                    height: parent.height;
+                    background: #ff0000;
+                    visible: playhead-pos >= 0.0;
+                }
+
+                // Mouse interaction
+                touch := TouchArea {
+                    width: parent.width;
+                    height: parent.height;
+                    mouse-cursor: is-panning ? MouseCursor.grabbing : MouseCursor.default;
+
+                    pointer-event(event) => {
+                        if event.button == PointerEventButton.left {
+                            if event.kind == PointerEventKind.down && !is-panning {
+                                // Convert screen position to audio position using view-start/view-end
+                                sel-start = view-start + clamp(self.mouse-x / parent.width, 0.0, 1.0) * (view-end - view-start);
+                                sel-end = sel-start;
+                            }
+                        }
+                        if event.button == PointerEventButton.middle {
+                            if event.kind == PointerEventKind.down {
+                                is-panning = true;
+                                pan-start-x = self.mouse-x / 1px;
+                                pan-start-offset = view-offset;
+                            } else if event.kind == PointerEventKind.up {
+                                is-panning = false;
+                            }
+                        }
+                    }
+
+                    moved => {
+                        if is-panning {
+                            // Pan: drag moves the view (inline calculation)
+                            view-offset = clamp(
+                                pan-start-offset + (pan-start-x - self.mouse-x / 1px) / (parent.width / 1px) / zoom-level,
+                                0.0,
+                                1.0 - 1.0 / zoom-level
+                            );
+                            zoom-changed(zoom-level, view-offset);
+                        } else if self.pressed {
+                            // Selection: convert screen position to audio position using view-start/view-end
+                            sel-end = view-start + clamp(self.mouse-x / parent.width, 0.0, 1.0) * (view-end - view-start);
+                            selection-changed(sel-start, sel-end);
+                        }
+                    }
+
+                    scroll-event(event) => {
+                        // Zoom at mouse position
+                        // Step 1: Store mouse position in normalized screen coords
+                        scroll-mouse-norm = self.mouse-x / parent.width;
+                        // Step 2: Store audio position under mouse (before zoom)
+                        scroll-mouse-audio = view-offset + scroll-mouse-norm / zoom-level;
+                        // Step 3: Calculate new zoom level (scroll down = zoom in)
+                        scroll-new-zoom = clamp(zoom-level * (event.delta-y > 0 ? 1.15 : 0.87), 1.0, 50.0);
+                        // Step 4: Adjust offset to keep mouse position fixed after zoom
+                        view-offset = clamp(scroll-mouse-audio - scroll-mouse-norm / scroll-new-zoom, 0.0, 1.0 - 1.0 / scroll-new-zoom);
+                        // Step 5: Apply new zoom
+                        zoom-level = scroll-new-zoom;
+                        zoom-changed(zoom-level, view-offset);
+                        return accept;
+                    }
+                }
+            }
+        }
+
+        // Controls
+        HorizontalBox {
+            spacing: 12px;
+            alignment: start;
+
+            Button {
+                text: is-playing ? "⏹ Stop" : "▶ Preview";
+                enabled: has-selection || is-playing;
+                clicked => {
+                    if is-playing {
+                        stop-clicked();
+                    } else {
+                        play-clicked();
+                    }
+                }
+            }
+
+            Button {
+                text: "💾 Save";
+                enabled: has-selection;
+                clicked => { save-clicked(); }
+            }
+
+            Rectangle { width: 8px; }
+
+            Rectangle {
+                width: 1px;
+                height: 28px;
+                background: #444444;
+            }
+
+            Rectangle { width: 8px; }
+
+            Button {
+                text: "🚫 Cancel";
+                clicked => { cancel-clicked(); }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            Text {
+                text: zoom-level > 1.0 ? "\{round(zoom-level * 10) / 10}x" : "";
+                color: #888888;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+        }
+
+        // Info bar
+        HorizontalBox {
+            spacing: 8px;
+
+            Text {
+                text: time-display != "" ? time-display : "Click and drag to select";
+                color: time-display != "" ? #ffffff : #888888;
+                font-family: "monospace";
+                font-size: 13px;
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            Text {
+                text: status;
+                color: #888888;
+                font-size: 13px;
+            }
+        }
+    }
+}
