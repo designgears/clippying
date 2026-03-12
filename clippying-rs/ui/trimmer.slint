@@ -58,6 +58,7 @@ export component Trimmer inherits Window {
                 width: parent.width;
                 height: parent.height;
                 background: #1e1e1e;
+                clip: true;
 
                 // Center line
                 Rectangle {
@@ -70,6 +71,12 @@ export component Trimmer inherits Window {
 
                 // Helper for audio-to-screen coordinate transform
                 property <float> view-range: max(0.0001, view-end - view-start);
+                property <float> selection-min: min(sel-start, sel-end);
+                property <float> selection-max: max(sel-start, sel-end);
+                property <float> visible-selection-start: max(view-start, selection-min);
+                property <float> visible-selection-end: min(view-end, selection-max);
+                property <bool> left-handle-visible: has-selection && selection-min >= view-start && selection-min <= view-end;
+                property <bool> right-handle-visible: has-selection && selection-max >= view_start && selection-max <= view-end;
                 function audio-to-screen(audio-pos: float) -> length {
                     return (audio-pos - view-start) / view-range * self.width;
                 }
@@ -82,12 +89,12 @@ export component Trimmer inherits Window {
 
                 // Selection highlight (transform from audio-space to screen-space)
                 Rectangle {
-                    x: parent.audio-to-screen(min(sel-start, sel-end));
+                    x: parent.audio-to-screen(parent.visible-selection-start);
                     y: 0;
-                    width: abs(sel-end - sel-start) / parent.view-range * parent.width;
+                    width: max(0px, (parent.visible-selection-end - parent.visible-selection-start) / parent.view-range * parent.width);
                     height: parent.height;
                     background: #3a86ff50;
-                    visible: has-selection;
+                    visible: has-selection && parent.visible-selection-end > parent.visible-selection-start;
                 }
 
                 // Waveform bars - peaks are pre-computed for visible range
@@ -102,38 +109,38 @@ export component Trimmer inherits Window {
 
                 // Selection edges (transform from audio-space to screen-space)
                 Rectangle {
-                    x: max(0px, min(parent.width - 4px, parent.audio-to-screen(min(sel-start, sel-end)) - 2px));
+                    x: max(0px, min(parent.width - 4px, parent.audio-to-screen(parent.selection-min) - 2px));
                     y: 0;
                     width: 4px;
                     height: parent.height;
                     background: #3a86ff;
-                    visible: has-selection;
+                    visible: parent.left-handle-visible;
                 }
                 Rectangle {
-                    x: max(0px, min(parent.width - 4px, parent.audio-to-screen(max(sel-start, sel-end)) - 2px));
+                    x: max(0px, min(parent.width - 4px, parent.audio-to-screen(parent.selection-max) - 2px));
                     y: 0;
                     width: 4px;
                     height: parent.height;
                     background: #3a86ff;
-                    visible: has-selection;
+                    visible: parent.right-handle-visible;
                 }
                 Rectangle {
-                    x: max(0px, min(parent.width - 12px, parent.audio-to-screen(min(sel-start, sel-end)) - 6px));
+                    x: max(0px, min(parent.width - 12px, parent.audio-to-screen(parent.selection-min) - 6px));
                     y: parent.height / 2 - 18px;
                     width: 12px;
                     height: 36px;
                     border-radius: 6px;
                     background: #3a86ff;
-                    visible: has-selection;
+                    visible: parent.left-handle-visible;
                 }
                 Rectangle {
-                    x: max(0px, min(parent.width - 12px, parent.audio-to-screen(max(sel-start, sel-end)) - 6px));
+                    x: max(0px, min(parent.width - 12px, parent.audio-to-screen(parent.selection-max) - 6px));
                     y: parent.height / 2 - 18px;
                     width: 12px;
                     height: 36px;
                     border-radius: 6px;
                     background: #3a86ff;
-                    visible: has-selection;
+                    visible: parent.right-handle-visible;
                 }
 
                 // Playhead (transform from audio-space to screen-space)
