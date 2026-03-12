@@ -1676,6 +1676,7 @@ class ClippyingFilePlayerAction(ClippyingActionBase):
 
         def work():
             try:
+                start_sec, end_sec = self._playback_range()
                 trimmer_args = [
                     exe,
                     "--stdin-pcm",
@@ -1685,6 +1686,15 @@ class ClippyingFilePlayerAction(ClippyingActionBase):
                 ]
                 if preview_sink:
                     trimmer_args.extend(["--preview-sink", preview_sink])
+                if start_sec is not None and end_sec is not None and end_sec > start_sec:
+                    trimmer_args.extend(
+                        [
+                            "--selection-start",
+                            f"{start_sec:.6f}",
+                            "--selection-end",
+                            f"{end_sec:.6f}",
+                        ]
+                    )
 
                 ffmpeg_proc = subprocess.Popen(
                     [

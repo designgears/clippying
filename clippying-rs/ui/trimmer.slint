@@ -35,6 +35,7 @@ export component Trimmer inherits Window {
     property <bool> is-panning: false;
     property <float> pan-start-x: 0.0;
     property <float> pan-start-offset: 0.0;
+    property <int> drag-mode: 0; // 0 = none, 1 = new selection, 2 = left handle, 3 = right handle
     // Helper properties for scroll zoom calculation
     property <float> scroll-mouse-norm: 0.0;
     property <float> scroll-mouse-audio: 0.0;
@@ -72,6 +73,12 @@ export component Trimmer inherits Window {
                 function audio-to-screen(audio-pos: float) -> length {
                     return (audio-pos - view-start) / view-range * self.width;
                 }
+                function screen-to-audio(screen-pos: length) -> float {
+                    return view-start + clamp(screen-pos / self.width, 0.0, 1.0) * view-range;
+                }
+                function handle-hit-padding() -> float {
+                    return 12px / self.width * view-range;
+                }
 
                 // Selection highlight (transform from audio-space to screen-space)
                 Rectangle {
@@ -95,19 +102,37 @@ export component Trimmer inherits Window {
 
                 // Selection edges (transform from audio-space to screen-space)
                 Rectangle {
-                    x: parent.audio-to-screen(min(sel-start, sel-end)) - 1px;
+                    x: parent.audio-to-screen(min(sel-start, sel-end)) - 2px;
                     y: 0;
-                    width: 2px;
+                    width: 4px;
                     height: parent.height;
                     background: #3a86ff;
                     visible: has-selection;
                 }
                 Rectangle {
-                    x: parent.audio-to-screen(max(sel-start, sel-end)) - 1px;
+                    x: parent.audio-to-screen(max(sel-start, sel-end)) - 2px;
                     y: 0;
-                    width: 2px;
+                    width: 4px;
                     height: parent.height;
                     background: #3a86ff;
+                    visible: has-selection;
+                }
+                Rectangle {
+                    x: parent.audio-to-screen(min(sel-start, sel-end)) - 6px;
+                    y: parent.height / 2 - 18px;
+                    width: 12px;
+                    height: 36px;
+                    border-radius: 6px;
+                    background: #3a86ffcc;
+                    visible: has-selection;
+                }
+                Rectangle {
+                    x: parent.audio-to-screen(max(sel-start, sel-end)) - 6px;
+                    y: parent.height / 2 - 18px;
+                    width: 12px;
+                    height: 36px;
+                    border-radius: 6px;
+                    background: #3a86ffcc;
                     visible: has-selection;
                 }
 
@@ -130,9 +155,22 @@ export component Trimmer inherits Window {
                     pointer-event(event) => {
                         if event.button == PointerEventButton.left {
                             if event.kind == PointerEventKind.down && !is-panning {
-                                // Convert screen position to audio position using view-start/view-end
-                                sel-start = view-start + clamp(self.mouse-x / parent.width, 0.0, 1.0) * (view-end - view-start);
-                                sel-end = sel-start;
+                                if has-selection
+                                    && abs(parent.screen-to-audio(self.mouse-x) - min(sel-start, sel-end)) <= parent.handle-hit-padding()
+                                {
+                                    drag-mode = 2;
+                                } else if has-selection
+                                    && abs(parent.screen-to-audio(self.mouse-x) - max(sel-start, sel-end)) <= parent.handle-hit-padding()
+                                {
+                                    drag-mode = 3;
+                                } else {
+                                    drag-mode = 1;
+                                    sel-start = parent.screen-to-audio(self.mouse-x);
+                                    sel-end = sel-start;
+                                    selection-changed(sel-start, sel-end);
+                                }
+                            } else if event.kind == PointerEventKind.up {
+                                drag-mode = 0;
                             }
                         }
                         if event.button == PointerEventButton.middle {
@@ -155,9 +193,22 @@ export component Trimmer inherits Window {
                                 1.0 - 1.0 / zoom-level
                             );
                             zoom-changed(zoom-level, view-offset);
-                        } else if self.pressed {
-                            // Selection: convert screen position to audio position using view-start/view-end
-                            sel-end = view-start + clamp(self.mouse-x / parent.width, 0.0, 1.0) * (view-end - view-start);
+                        } else if drag-mode == 1 {
+                            sel-end = parent.screen-to-audio(self.mouse-x);
+                            selection-changed(sel-start, sel-end);
+                        } else if drag-mode == 2 {
+                            if sel-start <= sel-end {
+                                sel-start = min(parent.screen-to-audio(self.mouse-x), sel-end);
+                            } else {
+                                sel-end = min(parent.screen-to-audio(self.mouse-x), sel-start);
+                            }
+                            selection-changed(sel-start, sel-end);
+                        } else if drag-mode == 3 {
+                            if sel-start <= sel-end {
+                                sel-end = max(parent.screen-to-audio(self.mouse-x), sel-start);
+                            } else {
+                                sel-start = max(parent.screen-to-audio(self.mouse-x), sel-end);
+                            }
                             selection-changed(sel-start, sel-end);
                         }
                     }

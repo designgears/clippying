@@ -40,7 +40,15 @@ fn ensure_embedded_exe() -> Result<String, String> {
 
     let out_path = PathBuf::from(format!("/tmp/clippying-native-{}", env!("CARGO_PKG_VERSION")));
     let should_write = match fs::metadata(&out_path) {
-        Ok(meta) => meta.len() != EMBEDDED_EXE_BYTES.len() as u64,
+        Ok(meta) => {
+            if meta.len() != EMBEDDED_EXE_BYTES.len() as u64 {
+                true
+            } else {
+                fs::read(&out_path)
+                    .map(|existing| existing != EMBEDDED_EXE_BYTES)
+                    .unwrap_or(true)
+            }
+        }
         Err(_) => true,
     };
 
