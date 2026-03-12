@@ -43,7 +43,13 @@ enum DaemonRequest {
     Monitor { source: String },
     Stop { source: String },
     StopAll,
-    Clip { source: String, #[serde(default)] preview_sink: Option<String> },
+    Clip {
+        source: String,
+        #[serde(default)]
+        preview_sink: Option<String>,
+        #[serde(default)]
+        clips_dir: Option<String>,
+    },
     Status,
     Sources,
     Sinks,
@@ -75,6 +81,8 @@ struct SinkEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClipSaved {
     path: String,
+    #[serde(default)]
+    saved_path: String,
 }
 
 fn broadcast_ws(ws_clients: &Arc<Mutex<Vec<mpsc::Sender<String>>>>, msg: &str) {
@@ -226,7 +234,7 @@ extern "C" fn handle_shutdown_signal(_: i32) {
 fn install_signal_handlers() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handle_shutdown_signal as usize;
+        sa.sa_sigaction = handle_shutdown_signal as *const () as usize;
         sa.sa_flags = 0;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
@@ -578,7 +586,7 @@ fn handle_request_bytes(
             stop_all_workers(workers);
             DaemonResponse::Ok
         }
-        DaemonRequest::Clip { source, preview_sink } => {
+        DaemonRequest::Clip { source, preview_sink, clips_dir } => {
             info!("clip requested (source={})", source);
             let worker = {
                 let Ok(map) = workers.lock() else {
@@ -598,6 +606,7 @@ fn handle_request_bytes(
                 ws_clients,
                 exe_path,
                 preview_sink.as_deref(),
+                clips_dir.as_deref(),
             );
             DaemonResponse::Ok
         }
@@ -656,6 +665,7 @@ fn clip_buffer(
     ws_clients: &Arc<Mutex<Vec<mpsc::Sender<String>>>>,
     exe_path: &str,
     preview_sink: Option<&str>,
+    clips_dir: Option<&str>,
 ) {
     let mono: Vec<i16> = {
         let b = match buffer.lock() {
@@ -680,6 +690,10 @@ fn clip_buffer(
         cmd.env("PULSE_SINK", sink);
         cmd.arg("--preview-sink").arg(sink);
     }
+    if let Some(dir) = clips_dir.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        cmd.arg("--clips-dir").arg(dir);
+    }
+    cmd.arg("--source").arg(source);
 
     let mut child = match cmd
         .stdin(Stdio::piped())
@@ -705,9 +719,10 @@ fn clip_buffer(
                 let Some(t) = v.get("type").and_then(|x| x.as_str()) else { continue };
                 if t != "clip_saved" { continue; }
                 let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let saved_path = v.get("saved_path").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 if !path.is_empty() {
                     if let Ok(mut slot) = last_clip.lock() {
-                        *slot = Some(ClipSaved { path });
+                        *slot = Some(ClipSaved { path, saved_path });
                     }
                 }
 

@@ -18,11 +18,24 @@ use pulse::sample::{Format, Spec};
 use pulse::stream::Direction;
 use psimple::Simple;
 
-mod daemon;
+use clippying::daemon;
 
 struct AudioClip {
     samples: Vec<i16>,
     sample_rate: u32,
+}
+
+#[derive(Clone)]
+struct SaveTarget {
+    clips_dir: Option<PathBuf>,
+    source: Option<String>,
+    mode: SaveMode,
+}
+
+#[derive(Clone, Copy)]
+enum SaveMode {
+    TrimToFile,
+    EmitSelection,
 }
 
 impl AudioClip {
@@ -67,14 +80,23 @@ fn main() {
                 .unwrap_or(1);
 
             let mut preview_sink: Option<String> = None;
+            let mut clips_dir: Option<PathBuf> = None;
+            let mut source: Option<String> = None;
+            let mut save_mode = SaveMode::TrimToFile;
             while let Some(a) = args.next() {
                 if a == "--preview-sink" {
                     preview_sink = args.next();
+                } else if a == "--clips-dir" {
+                    clips_dir = args.next().map(PathBuf::from);
+                } else if a == "--source" {
+                    source = args.next();
+                } else if a == "--emit-selection" {
+                    save_mode = SaveMode::EmitSelection;
                 }
             }
 
             info!("starting trimmer from stdin (rate={sample_rate}, channels={channels})");
-            run_trimmer_from_stdin(sample_rate, channels, preview_sink);
+            run_trimmer_from_stdin(sample_rate, channels, preview_sink, clips_dir, source, save_mode);
         }
         None => print_usage(),
         Some(other) => {
@@ -101,7 +123,14 @@ fn print_usage() {
     eprintln!("\n");
 }
 
-fn run_trimmer_from_stdin(sample_rate: u32, channels: u8, preview_sink: Option<String>) {
+fn run_trimmer_from_stdin(
+    sample_rate: u32,
+    channels: u8,
+    preview_sink: Option<String>,
+    clips_dir: Option<PathBuf>,
+    source: Option<String>,
+    save_mode: SaveMode,
+) {
     let mut buf = Vec::new();
     if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
         error!("failed to read stdin: {e}");
@@ -120,17 +149,25 @@ fn run_trimmer_from_stdin(sample_rate: u32, channels: u8, preview_sink: Option<S
         samples_i16
     };
 
-    run_trimmer_with_clip(Some(AudioClip { samples: mono, sample_rate }), preview_sink);
+    run_trimmer_with_clip(
+        Some(AudioClip { samples: mono, sample_rate }),
+        preview_sink,
+        SaveTarget {
+            clips_dir,
+            source,
+            mode: save_mode,
+        },
+    );
 }
 
-fn run_trimmer_with_clip(clip: Option<AudioClip>, preview_sink: Option<String>) {
+fn run_trimmer_with_clip(clip: Option<AudioClip>, preview_sink: Option<String>, save_target: SaveTarget) {
     if let Some(sink) = preview_sink.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         std::env::set_var("PULSE_SINK", sink);
         info!("using preview sink: {sink}");
     }
 
     let ui = Trimmer::new().unwrap();
-    let state = Rc::new(RefCell::new(TrimmerState::new(clip)));
+    let state = Rc::new(RefCell::new(TrimmerState::new(clip, save_target)));
 
     {
         let s = state.borrow();
@@ -140,6 +177,10 @@ fn run_trimmer_with_clip(clip: Option<AudioClip>, preview_sink: Option<String>) 
             ui.set_peaks(compute_peaks_model(&clip.samples));
             ui.set_status(SharedString::from(format!("Loaded ({:.1}s)", clip.duration_secs())));
         }
+        ui.set_save_label(SharedString::from(match s.save_target.mode {
+            SaveMode::TrimToFile => "💾 Save",
+            SaveMode::EmitSelection => "✓ Apply Range",
+        }));
     }
 
     let ui_weak = ui.as_weak();
@@ -267,14 +308,16 @@ struct TrimmerState {
     clip: Option<AudioClip>,
     selection: (f32, f32),
     playback: Option<Playback>,
+    save_target: SaveTarget,
 }
 
 impl TrimmerState {
-    fn new(clip: Option<AudioClip>) -> Self {
+    fn new(clip: Option<AudioClip>, save_target: SaveTarget) -> Self {
         Self {
             clip,
             selection: (0.0, 0.0),
             playback: None,
+            save_target,
         }
     }
 
@@ -392,6 +435,22 @@ impl TrimmerState {
         let mut end_idx = (end * clip.samples.len() as f32) as usize;
         if start_idx >= end_idx { return None; }
 
+        let duration_secs = clip.duration_secs();
+        let start_secs = start * duration_secs;
+        let end_secs = end * duration_secs;
+
+        if matches!(self.save_target.mode, SaveMode::EmitSelection) {
+            let evt = json!({
+                "type": "selection_saved",
+                "start": start_secs,
+                "end": end_secs,
+                "duration": duration_secs,
+            });
+            println!("{}", evt);
+            let _ = std::io::stdout().flush();
+            return Some(format!("Range: {:.2}s → {:.2}s", start_secs, end_secs));
+        }
+
         let threshold = 256i16;
         let padding = (clip.sample_rate as f32 * 0.15) as usize;
         let base_start_idx = start_idx;
@@ -405,12 +464,13 @@ impl TrimmerState {
             end_idx = (base_start_idx + last + 1 + padding).min(base_end_idx);
         }
 
-        let out_dir = clips_dir();
+        let out_dir = clips_dir(self.save_target.clips_dir.as_deref(), self.save_target.source.as_deref());
         if let Err(e) = std::fs::create_dir_all(&out_dir) {
             return Some(format!("Save error: {}", e));
         }
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let trimmed_path = out_dir.join(format!("clip_{}.wav", ts));
+        let latest_path = out_dir.join("latest.wav");
+        let archive_path = out_dir.join(format!("clip_{}.wav", ts));
 
         let spec = hound::WavSpec {
             channels: 1,
@@ -419,18 +479,26 @@ impl TrimmerState {
             sample_format: hound::SampleFormat::Int,
         };
 
-        match hound::WavWriter::create(&trimmed_path, spec) {
+        match hound::WavWriter::create(&latest_path, spec) {
             Ok(mut w) => {
                 for &s in &clip.samples[start_idx..end_idx] {
                     let _ = w.write_sample(s);
                 }
                 let _ = w.finalize();
+                let saved_path = match std::fs::copy(&latest_path, &archive_path) {
+                    Ok(_) => archive_path.clone(),
+                    Err(e) => {
+                        warn!("failed to archive clip copy: {e}");
+                        latest_path.clone()
+                    }
+                };
                 let evt = json!({
                     "type": "clip_saved",
-                    "path": trimmed_path.display().to_string(),
+                    "path": latest_path.display().to_string(),
+                    "saved_path": saved_path.display().to_string(),
                 });
                 println!("{}", evt);
-                Some(format!("Saved: {}", trimmed_path.display()))
+                Some(format!("Saved: {}", latest_path.display()))
             }
             Err(e) => Some(format!("Save error: {}", e)),
         }
@@ -466,6 +534,28 @@ fn compute_peaks_for_range(samples: &[i16], view_start: f32, view_end: f32, num_
     ModelRc::new(VecModel::from(peaks))
 }
 
-fn clips_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("clips")
+fn clips_dir(base_dir: Option<&std::path::Path>, source: Option<&str>) -> PathBuf {
+    let base = base_dir
+        .map(|path| path.to_path_buf())
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("clips"));
+    base.join(sanitize_source_for_path(source.unwrap_or("default-source")))
+}
+
+fn sanitize_source_for_path(source: &str) -> String {
+    let sanitized: String = source
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches(|ch| ch == '.' || ch == '_').to_string();
+    if trimmed.is_empty() {
+        "default-source".to_string()
+    } else {
+        trimmed
+    }
 }

@@ -3,7 +3,7 @@ from loguru import logger as log
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gtk, Adw
+from gi.repository import Adw, Gio, Gtk
 
 import os
 import sys
@@ -20,8 +20,11 @@ from src.backend.PluginManager.ActionInputSupport import ActionInputSupport
 from src.Signals.Signals import AppQuit
 
 from actions import (
-    ClippyingClipButtonAction,
+    ClippyingCaptureAction,
+    ClippyingFilePlayerAction,
+    ClippyingLastClipPlaybackAction,
     ClippyingWsClient,
+    notify_plugin_settings_changed,
     start_host_manager,
     stop_daemon_best_effort,
     stop_host_manager,
@@ -41,18 +44,44 @@ class Clippying(PluginBase):
 
         self.lm = self.locale_manager
 
-        self.clip_button_holder = ActionHolder(
+        self.capture_button_holder = ActionHolder(
             plugin_base=self,
-            action_base=ClippyingClipButtonAction,
-            action_id_suffix="ClipButton",
-            action_name=self.lm.get("actions.clip_button.name"),
+            action_base=ClippyingCaptureAction,
+            action_id_suffix="CaptureButton",
+            action_name=self.lm.get("actions.capture_button.name"),
             action_support={
                 Input.Key: ActionInputSupport.SUPPORTED,
                 Input.Dial: ActionInputSupport.UNSUPPORTED,
                 Input.Touchscreen: ActionInputSupport.UNSUPPORTED,
             },
         )
-        self.add_action_holder(self.clip_button_holder)
+        self.add_action_holder(self.capture_button_holder)
+
+        self.latest_clip_button_holder = ActionHolder(
+            plugin_base=self,
+            action_base=ClippyingLastClipPlaybackAction,
+            action_id_suffix="LatestClipButton",
+            action_name=self.lm.get("actions.latest_clip_button.name"),
+            action_support={
+                Input.Key: ActionInputSupport.SUPPORTED,
+                Input.Dial: ActionInputSupport.UNSUPPORTED,
+                Input.Touchscreen: ActionInputSupport.UNSUPPORTED,
+            },
+        )
+        self.add_action_holder(self.latest_clip_button_holder)
+
+        self.file_player_button_holder = ActionHolder(
+            plugin_base=self,
+            action_base=ClippyingFilePlayerAction,
+            action_id_suffix="FilePlayerButton",
+            action_name=self.lm.get("actions.file_player_button.name"),
+            action_support={
+                Input.Key: ActionInputSupport.SUPPORTED,
+                Input.Dial: ActionInputSupport.UNSUPPORTED,
+                Input.Touchscreen: ActionInputSupport.UNSUPPORTED,
+            },
+        )
+        self.add_action_holder(self.file_player_button_holder)
 
         self.register(
             plugin_name=self.lm.get("plugin.name"),
@@ -103,6 +132,22 @@ class Clippying(PluginBase):
             settings = {}
         settings["preview_sink"] = (sink or "").strip()
         self.set_settings(settings)
+
+    def _clips_dir(self) -> str:
+        try:
+            settings = self.get_settings() or {}
+        except Exception:
+            settings = {}
+        return os.path.abspath(os.path.expanduser((settings.get("clips_dir") or "~/clips").strip() or "~/clips"))
+
+    def _set_clips_dir(self, path: str) -> None:
+        try:
+            settings = self.get_settings() or {}
+        except Exception:
+            settings = {}
+        settings["clips_dir"] = os.path.abspath(os.path.expanduser((path or "~/clips").strip() or "~/clips"))
+        self.set_settings(settings)
+        notify_plugin_settings_changed()
 
     def get_settings_area(self):
         group = Adw.PreferencesGroup(title="General")
@@ -178,6 +223,50 @@ class Clippying(PluginBase):
 
         preview_sink_row.connect("notify::selected", on_preview_sink_selected)
         group.add(preview_sink_row)
+
+        clips_row = Adw.ActionRow(title="Clips directory")
+        clips_row.set_subtitle(self._clips_dir())
+
+        browse_button = Gtk.Button(label="Browse", valign=Gtk.Align.CENTER)
+        reset_button = Gtk.Button(label="Reset", valign=Gtk.Align.CENTER)
+
+        def refresh_clips_row():
+            clips_row.set_subtitle(self._clips_dir())
+
+        def on_clips_selected(dialog: Gtk.FileDialog, result):
+            try:
+                selected = dialog.select_folder_finish(result)
+            except Exception:
+                return
+            if not selected:
+                return
+            self._set_clips_dir(selected.get_path() or "")
+            refresh_clips_row()
+
+        def on_browse_clicked(*_args):
+            dialog = Gtk.FileDialog.new()
+            dialog.set_title("Select clips directory")
+            dialog.set_modal(True)
+            try:
+                dialog.set_initial_folder(Gio.File.new_for_path(self._clips_dir()))
+            except Exception:
+                pass
+            dialog.select_folder(gl.app.get_active_window(), None, on_clips_selected)
+
+        def on_reset_clicked(*_args):
+            self._set_clips_dir("~/clips")
+            refresh_clips_row()
+
+        browse_button.connect("clicked", on_browse_clicked)
+        reset_button.connect("clicked", on_reset_clicked)
+
+        clips_row.add_suffix(reset_button)
+        clips_row.add_suffix(browse_button)
+        group.add(clips_row)
+
+        layout_row = Adw.ActionRow(title="Latest clip path pattern")
+        layout_row.set_subtitle(f"{self._clips_dir()}/<source>/latest.wav")
+        group.add(layout_row)
 
         return group
 

@@ -56,6 +56,15 @@ fn ensure_embedded_exe() -> Result<String, String> {
 }
 
 #[pyfunction]
+fn resolve_exe(exe: String) -> PyResult<String> {
+    if exe.trim().is_empty() || exe == "__embedded__" {
+        ensure_embedded_exe().map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    } else {
+        Ok(exe)
+    }
+}
+
+#[pyfunction]
 fn api_is_up(url: String) -> bool {
     tcp_up(&url)
 }
@@ -96,5 +105,6 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(api_is_up, m)?)?;
     m.add_function(wrap_pyfunction!(ensure_api, m)?)?;
     m.add_function(wrap_pyfunction!(stop_api, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_exe, m)?)?;
     Ok(())
 }

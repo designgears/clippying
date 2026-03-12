@@ -7,10 +7,10 @@
   "author": "DesignGears",
   "github": "https://github.com/designgears/clippying",
   "descriptions": {
-    "en_US": "Clip audio from a selected monitor source via the clippying WebSocket API."
+    "en_US": "Capture audio clips, replay the latest clip, and play custom files via the clippying WebSocket API."
   },
   "short-descriptions": {
-    "en_US": "Clip Button"
+    "en_US": "Capture and Playback"
   },
   "tags": ["audio", "utility"],
   "minimum-app-version": "1.5.0-beta.12",

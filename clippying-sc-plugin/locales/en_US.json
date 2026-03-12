@@ -1,5 +1,7 @@
 {
   "plugin.name": "Clippying",
 
-  "actions.clip_button.name": "Clip Button"
+  "actions.capture_button.name": "Capture Button",
+  "actions.latest_clip_button.name": "Latest Clip Button",
+  "actions.file_player_button.name": "Audio File Player"
 }

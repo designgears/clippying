@@ -24,6 +24,7 @@ export component Trimmer inherits Window {
     in property <float> playhead-pos: -1.0;  // -1 = hidden
     in property <float> view-start: 0.0;  // Start of visible range in audio-space
     in property <float> view-end: 1.0;    // End of visible range in audio-space
+    in property <string> save-label: "💾 Save";
 
     // Internal selection state
     in-out property <float> sel-start: 0.0;
@@ -198,7 +199,7 @@ export component Trimmer inherits Window {
             }
 
             Button {
-                text: "💾 Save";
+                text: save-label;
                 enabled: has-selection;
                 clicked => { save-clicked(); }
             }
