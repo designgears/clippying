@@ -1290,6 +1290,12 @@ class ClippyingCaptureAction(ClippyingActionBase):
         self._flash_button([28, 138, 84, 255], blinks=3)
         self._refresh_labels()
 
+    def _clear_waiting_clip(self) -> None:
+        with self._clip_lock:
+            self._waiting_for_source = None
+            self._waiting_clip = None
+            self._waiting_event.clear()
+
     def _ensure_monitoring(self) -> None:
         if not self._ensure_daemon_running():
             return
@@ -1362,22 +1368,27 @@ class ClippyingCaptureAction(ClippyingActionBase):
                     payload["preview_sink"] = preview_sink
                 resp = self._ws().request(payload)
             except Exception as e:
+                self._clear_waiting_clip()
                 log.error(f"clip failed: {e}")
                 GLib.idle_add(lambda: self.set_center_label("Clip failed", font_size=14))
                 return
 
             if resp.get("type") != "ok":
+                self._clear_waiting_clip()
                 log.error(f"clip error: {resp}")
                 GLib.idle_add(lambda: self.set_center_label("Clip error", font_size=14))
                 return
 
             if not self._waiting_event.wait(timeout=60):
+                self._clear_waiting_clip()
                 GLib.idle_add(lambda: self.set_center_label("Timeout", font_size=14))
                 return
 
             with self._clip_lock:
                 clip = dict(self._waiting_clip or {})
                 self._waiting_for_source = None
+                self._waiting_clip = None
+                self._waiting_event.clear()
 
             path = (clip.get("path") or "").strip()
             saved_path = (clip.get("saved_path") or "").strip()

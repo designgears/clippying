@@ -707,10 +707,13 @@ fn clip_buffer(
         }
     };
 
+    let saw_clip_event = Arc::new(AtomicBool::new(false));
+    let source_name = source.to_string();
     if let Some(stdout) = child.stdout.take() {
         let last_clip = last_clip.clone();
-        let ws_clients = ws_clients.clone();
-        let source = source.to_string();
+        let ws_clients_reader = ws_clients.clone();
+        let source_reader = source_name.clone();
+        let saw_clip_event_reader = saw_clip_event.clone();
         thread::spawn(move || {
             use std::io::{BufRead, BufReader};
             let reader = BufReader::new(stdout);
@@ -718,6 +721,7 @@ fn clip_buffer(
                 let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
                 let Some(t) = v.get("type").and_then(|x| x.as_str()) else { continue };
                 if t != "clip_saved" { continue; }
+                saw_clip_event_reader.store(true, Ordering::Relaxed);
                 let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let saved_path = v.get("saved_path").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 if !path.is_empty() {
@@ -727,10 +731,10 @@ fn clip_buffer(
                 }
 
                 if let Some(obj) = v.as_object_mut() {
-                    obj.insert("source".to_string(), serde_json::Value::String(source.clone()));
+                    obj.insert("source".to_string(), serde_json::Value::String(source_reader.clone()));
                 }
                 let out = serde_json::to_string(&v).unwrap_or(line);
-                broadcast_ws(&ws_clients, &out);
+                broadcast_ws(&ws_clients_reader, &out);
             }
         });
     }
@@ -742,9 +746,19 @@ fn clip_buffer(
         }
     }
     drop(child.stdin.take());
-
-    // Ensure the child is reaped so we don't accumulate zombies.
+    let ws_clients_wait = ws_clients.clone();
+    let source_wait = source_name.clone();
     thread::spawn(move || {
         let _ = child.wait();
+        if !saw_clip_event.load(Ordering::Relaxed) {
+            let canceled = serde_json::json!({
+                "type": "clip_saved",
+                "source": source_wait,
+                "path": "",
+                "saved_path": "",
+                "canceled": true,
+            });
+            broadcast_ws(&ws_clients_wait, &canceled.to_string());
+        }
     });
 }

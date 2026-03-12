@@ -102,7 +102,7 @@ export component Trimmer inherits Window {
 
                 // Selection edges (transform from audio-space to screen-space)
                 Rectangle {
-                    x: parent.audio-to-screen(min(sel-start, sel-end)) - 2px;
+                    x: max(0px, min(parent.width - 4px, parent.audio-to-screen(min(sel-start, sel-end)) - 2px));
                     y: 0;
                     width: 4px;
                     height: parent.height;
@@ -110,7 +110,7 @@ export component Trimmer inherits Window {
                     visible: has-selection;
                 }
                 Rectangle {
-                    x: parent.audio-to-screen(max(sel-start, sel-end)) - 2px;
+                    x: max(0px, min(parent.width - 4px, parent.audio-to-screen(max(sel-start, sel-end)) - 2px));
                     y: 0;
                     width: 4px;
                     height: parent.height;
@@ -118,21 +118,21 @@ export component Trimmer inherits Window {
                     visible: has-selection;
                 }
                 Rectangle {
-                    x: parent.audio-to-screen(min(sel-start, sel-end)) - 6px;
+                    x: max(0px, min(parent.width - 12px, parent.audio-to-screen(min(sel-start, sel-end)) - 6px));
                     y: parent.height / 2 - 18px;
                     width: 12px;
                     height: 36px;
                     border-radius: 6px;
-                    background: #3a86ffcc;
+                    background: #3a86ff;
                     visible: has-selection;
                 }
                 Rectangle {
-                    x: parent.audio-to-screen(max(sel-start, sel-end)) - 6px;
+                    x: max(0px, min(parent.width - 12px, parent.audio-to-screen(max(sel-start, sel-end)) - 6px));
                     y: parent.height / 2 - 18px;
                     width: 12px;
                     height: 36px;
                     border-radius: 6px;
-                    background: #3a86ffcc;
+                    background: #3a86ff;
                     visible: has-selection;
                 }
 
