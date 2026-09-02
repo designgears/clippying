@@ -54,6 +54,40 @@ _AUDIO_FILE_PATTERNS = [
 ]
 _AUDIO_FILE_EXTENSIONS = {os.path.splitext(pattern)[1].lower() for pattern in _AUDIO_FILE_PATTERNS}
 
+# Boost bounds shared with the Rust side (see clippying-rs/src/gain.rs).
+MIN_GAIN_DB = -30.0
+MAX_GAIN_DB = 30.0
+# PulseAudio's 100% volume; paplay accepts higher values for amplification.
+# Its scale is cubic, so an amplitude factor of 10**(dB/20) is 10**(dB/60) here.
+_PA_VOLUME_NORM = 65536
+
+
+def clamp_gain_db(value: Any) -> float:
+    try:
+        db = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if db != db:  # NaN
+        return 0.0
+    return round(max(MIN_GAIN_DB, min(MAX_GAIN_DB, db)), 2)
+
+
+def _gain_db_to_pa_volume(gain_db: float) -> int:
+    return max(0, min(_PA_VOLUME_NORM * 4, round(_PA_VOLUME_NORM * (10 ** (gain_db / 60.0)))))
+
+
+def _paplay_volume_args(gain_db: float) -> list[str]:
+    """Play under our own name at an explicit volume.
+
+    The volume is always passed, even at 0 dB, so PulseAudio's saved per-app
+    volume can never re-apply an old boost. The name keeps that saved volume
+    out of the shared `paplay` entry, which other apps on the box use too.
+    """
+    return [
+        f"--volume={_gain_db_to_pa_volume(gain_db)}",
+        "--property=application.name=clippying",
+    ]
+
 
 def _run_clippying(exe: str, args: list[str]) -> tuple[bool, str]:
     if not exe:
@@ -439,6 +473,7 @@ class AudioPlayer:
         loop: bool = False,
         start_sec: float | None = None,
         end_sec: float | None = None,
+        gain_db: float = 0.0,
     ) -> bool:
         path = (path or "").strip()
         if not path or not os.path.exists(path):
@@ -449,7 +484,9 @@ class AudioPlayer:
             self._session_id += 1
             session_id = self._session_id
 
-        spawned = self._spawn_process(path, sink=sink, start_sec=start_sec, end_sec=end_sec)
+        spawned = self._spawn_process(
+            path, sink=sink, start_sec=start_sec, end_sec=end_sec, gain_db=gain_db
+        )
         if spawned is None:
             return False
         process, cleanup_path = spawned
@@ -463,7 +500,7 @@ class AudioPlayer:
 
         thread = threading.Thread(
             target=self._watch_process,
-            args=(session_id, path, sink, loop, start_sec, end_sec, process, cleanup_path),
+            args=(session_id, path, sink, loop, start_sec, end_sec, gain_db, process, cleanup_path),
             daemon=True,
             name="clippying-audio-player",
         )
@@ -476,11 +513,14 @@ class AudioPlayer:
         sink: str | None = None,
         start_sec: float | None = None,
         end_sec: float | None = None,
+        gain_db: float = 0.0,
     ) -> bool:
         path = (path or "").strip()
         if not path or not os.path.exists(path):
             return False
-        spawned = self._spawn_process(path, sink=sink, start_sec=start_sec, end_sec=end_sec)
+        spawned = self._spawn_process(
+            path, sink=sink, start_sec=start_sec, end_sec=end_sec, gain_db=gain_db
+        )
         if spawned is None:
             return False
         process, cleanup_path = spawned
@@ -502,6 +542,7 @@ class AudioPlayer:
         loop: bool,
         start_sec: float | None,
         end_sec: float | None,
+        gain_db: float,
         process: subprocess.Popen,
         cleanup_path: str | None,
     ) -> None:
@@ -520,7 +561,9 @@ class AudioPlayer:
                         self._process = None
                     return
 
-            next_spawned = self._spawn_process(path, sink=sink, start_sec=start_sec, end_sec=end_sec)
+            next_spawned = self._spawn_process(
+                path, sink=sink, start_sec=start_sec, end_sec=end_sec, gain_db=gain_db
+            )
             if next_spawned is None:
                 with self._lock:
                     if self._session_id == session_id and self._process is current:
@@ -545,8 +588,10 @@ class AudioPlayer:
         sink: str | None = None,
         start_sec: float | None = None,
         end_sec: float | None = None,
+        gain_db: float = 0.0,
     ) -> tuple[subprocess.Popen, str | None] | None:
         sink = (sink or "").strip() or None
+        gain_db = clamp_gain_db(gain_db)
         if start_sec is not None or end_sec is not None:
             builders = [
                 self._build_ffmpeg_paplay_command,
@@ -564,7 +609,7 @@ class AudioPlayer:
                 self._build_ffplay_command,
             ]
         for builder in builders:
-            command = builder(path, sink, start_sec, end_sec)
+            command = builder(path, sink, start_sec, end_sec, gain_db)
             if command is None:
                 continue
             args, env, cleanup_path = command
@@ -581,6 +626,7 @@ class AudioPlayer:
         sink: str | None,
         start_sec: float | None,
         end_sec: float | None,
+        gain_db: float,
     ) -> tuple[list[str], dict[str, str], str | None] | None:
         ffplay = shutil.which("ffplay")
         if not ffplay:
@@ -595,6 +641,8 @@ class AudioPlayer:
             args.extend(["-t", f"{(end_sec - start_sec):.6f}"])
         elif end_sec is not None and end_sec > 0:
             args.extend(["-t", f"{end_sec:.6f}"])
+        if gain_db:
+            args.extend(["-af", f"volume={gain_db:.2f}dB"])
         args.append(path)
         return args, env, None
 
@@ -604,13 +652,14 @@ class AudioPlayer:
         sink: str | None,
         start_sec: float | None,
         end_sec: float | None,
+        gain_db: float,
     ) -> tuple[list[str], dict[str, str] | None, str | None] | None:
         paplay = shutil.which("paplay")
         if not paplay:
             return None
         if start_sec is not None or end_sec is not None or not _is_wav_file(path):
             return None
-        args = [paplay]
+        args = [paplay, *_paplay_volume_args(gain_db)]
         if sink:
             args.extend(["-d", sink])
         args.append(path)
@@ -622,15 +671,17 @@ class AudioPlayer:
         sink: str | None,
         start_sec: float | None,
         end_sec: float | None,
+        gain_db: float,
     ) -> tuple[list[str], dict[str, str] | None, str | None] | None:
         paplay = shutil.which("paplay")
         ffmpeg = shutil.which("ffmpeg")
         if not paplay or not ffmpeg:
             return None
-        temp_path = self._render_temp_wav(path, start_sec, end_sec, ffmpeg)
+        # Gain is baked into the rendered file, so paplay plays it at unity.
+        temp_path = self._render_temp_wav(path, start_sec, end_sec, gain_db, ffmpeg)
         if temp_path is None:
             return None
-        args = [paplay]
+        args = [paplay, *_paplay_volume_args(0.0)]
         if sink:
             args.extend(["-d", sink])
         args.append(temp_path)
@@ -642,11 +693,13 @@ class AudioPlayer:
         sink: str | None,
         start_sec: float | None,
         end_sec: float | None,
+        gain_db: float,
     ) -> tuple[list[str], dict[str, str] | None, str | None] | None:
         aplay = shutil.which("aplay")
         if not aplay:
             return None
-        if sink or start_sec is not None or end_sec is not None or not _is_wav_file(path):
+        # aplay has no volume control; a boost has to go through ffmpeg.
+        if sink or gain_db or start_sec is not None or end_sec is not None or not _is_wav_file(path):
             return None
         return [aplay, path], None, None
 
@@ -656,12 +709,13 @@ class AudioPlayer:
         sink: str | None,
         start_sec: float | None,
         end_sec: float | None,
+        gain_db: float,
     ) -> tuple[list[str], dict[str, str] | None, str | None] | None:
         aplay = shutil.which("aplay")
         ffmpeg = shutil.which("ffmpeg")
         if sink or not aplay or not ffmpeg:
             return None
-        temp_path = self._render_temp_wav(path, start_sec, end_sec, ffmpeg)
+        temp_path = self._render_temp_wav(path, start_sec, end_sec, gain_db, ffmpeg)
         if temp_path is None:
             return None
         return [aplay, temp_path], None, temp_path
@@ -671,6 +725,7 @@ class AudioPlayer:
         path: str,
         start_sec: float | None,
         end_sec: float | None,
+        gain_db: float,
         ffmpeg: str,
     ) -> str | None:
         fd, temp_path = tempfile.mkstemp(prefix="clippying-playback-", suffix=".wav")
@@ -684,6 +739,8 @@ class AudioPlayer:
             args.extend(["-t", f"{(end_sec - start_sec):.6f}"])
         elif end_sec is not None and end_sec > 0:
             args.extend(["-t", f"{end_sec:.6f}"])
+        if gain_db:
+            args.extend(["-af", f"volume={gain_db:.2f}dB"])
         args.extend(["-vn", "-acodec", "pcm_s16le", "-y", temp_path])
 
         try:
@@ -900,6 +957,15 @@ class ClippyingActionBase(ActionBase):
     def _shared_source(self) -> str | None:
         return None
 
+    def _playback_gain_db(self) -> float:
+        return clamp_gain_db(self.settings.get("playback_gain_db"))
+
+    def _capture_gain_db(self) -> float:
+        return clamp_gain_db(_plugin_settings(self.plugin_base).get("capture_gain_db"))
+
+    def _clip_gain_db(self) -> float:
+        return clamp_gain_db(_plugin_settings(self.plugin_base).get("clip_gain_db"))
+
     def _ensure_daemon_running(self) -> bool:
         return _HOST_MANAGER.ensure_now(self._ws_url(), self._clippying_exe())
 
@@ -1113,6 +1179,32 @@ class ClippyingActionBase(ActionBase):
         row.connect("notify::selected", on_selected)
         return row
 
+    def _gain_row(
+        self,
+        key: str = "playback_gain_db",
+        title: str = "Volume boost",
+        subtitle: str = "Extra gain applied on playback (0 dB leaves the clip untouched)",
+    ) -> Adw.SpinRow:
+        adjustment = Gtk.Adjustment(
+            lower=MIN_GAIN_DB,
+            upper=MAX_GAIN_DB,
+            step_increment=0.5,
+            page_increment=3.0,
+            value=clamp_gain_db(self.settings.get(key)),
+        )
+        row = Adw.SpinRow(title=title, subtitle=subtitle, adjustment=adjustment, digits=1)
+
+        def on_value_changed(*_args):
+            value = clamp_gain_db(row.get_value())
+            if value == clamp_gain_db(self.settings.get(key)):
+                return
+            self.settings[key] = value
+            self.set_settings(self.settings)
+            self._refresh_labels()
+
+        row.connect("notify::value", on_value_changed)
+        return row
+
     def _mode_combo_row(
         self,
         title: str,
@@ -1262,6 +1354,13 @@ class ClippyingCaptureAction(ClippyingActionBase):
         super().on_remove()
         self._ensure_monitoring()
 
+    def on_plugin_settings_changed(self) -> None:
+        super().on_plugin_settings_changed()
+        # Picks up a changed capture boost without restarting the workers.
+        threading.Thread(
+            target=self._ensure_monitoring, daemon=True, name="clippying-gain-sync"
+        ).start()
+
     def _after_source_changed(self) -> None:
         self._ensure_monitoring()
 
@@ -1308,6 +1407,7 @@ class ClippyingCaptureAction(ClippyingActionBase):
             }
 
         desired_sources.discard(None)
+        capture_gain_db = self._capture_gain_db()
 
         try:
             if not desired_sources:
@@ -1323,7 +1423,17 @@ class ClippyingCaptureAction(ClippyingActionBase):
                 self._ws().request({"cmd": "stop", "source": source})
 
             for source in sorted(desired_sources - current_sources):
-                self._ws().request({"cmd": "monitor", "source": source})
+                self._ws().request({"cmd": "monitor", "source": source, "gain_db": capture_gain_db})
+
+            stale_gain = {
+                status.get("source")
+                for status in statuses
+                if isinstance(status, dict)
+                and status.get("source") in desired_sources
+                and clamp_gain_db(status.get("gain_db")) != capture_gain_db
+            }
+            for source in sorted(stale_gain):
+                self._ws().request({"cmd": "set_gain", "source": source, "gain_db": capture_gain_db})
         except Exception as e:
             log.error(f"monitor sync failed: {e}")
 
@@ -1363,6 +1473,7 @@ class ClippyingCaptureAction(ClippyingActionBase):
                     "cmd": "clip",
                     "source": source,
                     "clips_dir": self._clips_dir(),
+                    "gain_db": self._clip_gain_db(),
                 }
                 if preview_sink:
                     payload["preview_sink"] = preview_sink
@@ -1470,6 +1581,7 @@ class ClippyingLastClipPlaybackAction(ClippyingActionBase):
             self._open_plugin_settings_row(),
             self._source_combo_row(),
             self._sink_combo_row(),
+            self._gain_row(),
             self._playback_mode_row(),
         ]
 
@@ -1495,14 +1607,23 @@ class ClippyingLastClipPlaybackAction(ClippyingActionBase):
         if not path:
             log.debug("No latest clip available for playback")
             return
-        if not self._player.play(path, sink=self._selected_sink(), loop=loop):
+        if not self._player.play(
+            path,
+            sink=self._selected_sink(),
+            loop=loop,
+            gain_db=self._playback_gain_db(),
+        ):
             log.warning("Failed to start latest-clip playback")
 
     def _play_latest_overlap(self) -> None:
         path = self._resolved_latest_path()
         if not path:
             return
-        if not self._player.play_overlap(path, sink=self._selected_sink()):
+        if not self._player.play_overlap(
+            path,
+            sink=self._selected_sink(),
+            gain_db=self._playback_gain_db(),
+        ):
             log.warning("Failed to overlap latest-clip playback")
 
     def _refresh_labels(self) -> None:
@@ -1601,6 +1722,7 @@ class ClippyingFilePlayerAction(ClippyingActionBase):
         )
 
         rows.append(self._sink_combo_row())
+        rows.append(self._gain_row())
         rows.append(self._playback_mode_row())
         return rows
 
@@ -1685,6 +1807,8 @@ class ClippyingFilePlayerAction(ClippyingActionBase):
             log.warning("Range editor requires ffmpeg")
             return
 
+        gain_db = self._playback_gain_db()
+
         def work():
             try:
                 start_sec, end_sec = self._playback_range()
@@ -1697,6 +1821,8 @@ class ClippyingFilePlayerAction(ClippyingActionBase):
                 ]
                 if preview_sink:
                     trimmer_args.extend(["--preview-sink", preview_sink])
+                if gain_db:
+                    trimmer_args.extend(["--gain", f"{gain_db:.2f}"])
                 if start_sec is not None and end_sec is not None and end_sec > start_sec:
                     trimmer_args.extend(
                         [
@@ -1764,14 +1890,20 @@ class ClippyingFilePlayerAction(ClippyingActionBase):
                         continue
                     start_sec = payload.get("start")
                     end_sec = payload.get("end")
-                    GLib.idle_add(self._apply_playback_range, start_sec, end_sec)
+                    GLib.idle_add(
+                        self._apply_playback_range,
+                        start_sec,
+                        end_sec,
+                        clamp_gain_db(payload.get("gain_db")),
+                    )
                     return
             except Exception as e:
                 log.error(f"Failed to open range editor: {e}")
 
         threading.Thread(target=work, daemon=True, name="clippying-range-editor").start()
 
-    def _apply_playback_range(self, start_sec: float, end_sec: float) -> bool:
+    def _apply_playback_range(self, start_sec: float, end_sec: float, gain_db: float = 0.0) -> bool:
+        self.settings["playback_gain_db"] = clamp_gain_db(gain_db)
         self._set_playback_range(start_sec, end_sec)
         return False
 
@@ -1787,6 +1919,7 @@ class ClippyingFilePlayerAction(ClippyingActionBase):
             loop=loop,
             start_sec=start_sec,
             end_sec=end_sec,
+            gain_db=self._playback_gain_db(),
         ):
             log.warning(f"Failed to start file playback for {path}")
 
@@ -1800,6 +1933,7 @@ class ClippyingFilePlayerAction(ClippyingActionBase):
             sink=self._selected_sink(),
             start_sec=start_sec,
             end_sec=end_sec,
+            gain_db=self._playback_gain_db(),
         ):
             log.warning(f"Failed to overlap file playback for {path}")
 

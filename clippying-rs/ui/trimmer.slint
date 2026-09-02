@@ -1,4 +1,4 @@
-import { Button, VerticalBox, HorizontalBox } from "std-widgets.slint";
+import { Button, Slider, VerticalBox, HorizontalBox } from "std-widgets.slint";
 
 export component Trimmer inherits Window {
     title: "Clippying Trimmer";
@@ -13,6 +13,7 @@ export component Trimmer inherits Window {
     callback cancel-clicked();
     callback selection-changed(float, float);
     callback zoom-changed(float, float);  // zoom-level, view-offset
+    callback gain-changed(float);         // boost in dB
 
     // Properties from Rust
     in property <string> status: "Drop a WAV file or pass path as argument";
@@ -25,6 +26,13 @@ export component Trimmer inherits Window {
     in property <float> view-start: 0.0;  // Start of visible range in audio-space
     in property <float> view-end: 1.0;    // End of visible range in audio-space
     in property <string> save-label: "💾 Save";
+
+    // Boost: dB drives the audio, linear scales the waveform, peak-max is the
+    // loudest sample in the selection so we can warn before it clips.
+    in-out property <float> gain-db: 0.0;
+    in property <float> gain-linear: 1.0;
+    in property <float> peak-max: 0.0;
+    property <bool> gain-clips: peak-max * gain-linear > 1.0;
 
     // Internal selection state
     in-out property <float> sel-start: 0.0;
@@ -97,14 +105,17 @@ export component Trimmer inherits Window {
                     visible: has-selection && parent.visible-selection-end > parent.visible-selection-start;
                 }
 
-                // Waveform bars - peaks are pre-computed for visible range
+                // Waveform bars - peaks are pre-computed for visible range and
+                // scaled here so boost changes redraw without a recompute
                 for peak[i] in peaks: Rectangle {
                     property <float> bar-pos: i / peaks.length;  // 0-1 within visible range
+                    property <float> boosted: abs(peak) * gain-linear;
+                    property <float> bar-level: min(1.0, boosted);
                     x: bar-pos * parent.width;
-                    y: parent.height / 2 - abs(peak) * parent.height / 2 * 0.9;
+                    y: parent.height / 2 - bar-level * parent.height / 2 * 0.9;
                     width: max(1px, parent.width / peaks.length);
-                    height: max(1px, abs(peak) * parent.height * 0.9);
-                    background: #00ff88;
+                    height: max(1px, bar-level * parent.height * 0.9);
+                    background: boosted >= 1.0 ? #ff5c5c : #00ff88;
                 }
 
                 // Selection edges (transform from audio-space to screen-space)
@@ -278,6 +289,58 @@ export component Trimmer inherits Window {
             }
 
             Rectangle { horizontal-stretch: 1; }
+
+            // Boost
+            Text {
+                text: "CLIP";
+                color: #ff5c5c;
+                font-size: 11px;
+                font-weight: 700;
+                vertical-alignment: center;
+                visible: gain-clips;
+            }
+
+            Text {
+                text: "🔊";
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+
+            Slider {
+                width: 130px;
+                minimum: -30;
+                maximum: 30;
+                step: 0.5;
+                value <=> gain-db;
+                changed(value) => { gain-changed(value); }
+            }
+
+            gain-readout := Rectangle {
+                width: 62px;
+                height: 24px;
+                border-radius: 4px;
+                background: gain-touch.has-hover ? #ffffff14 : transparent;
+
+                Text {
+                    text: "\{gain-db > 0 ? "+" : ""}\{round(gain-db * 10) / 10} dB";
+                    color: gain-clips ? #ff5c5c : (gain-db != 0 ? #ffd166 : #888888);
+                    font-family: "monospace";
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+
+                // Click the readout to get back to unity gain
+                gain-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        gain-db = 0;
+                        gain-changed(0);
+                    }
+                }
+            }
 
             Text {
                 text: zoom-level > 1.0 ? "\{round(zoom-level * 10) / 10}x" : "";

@@ -20,10 +20,13 @@ from src.backend.PluginManager.ActionInputSupport import ActionInputSupport
 from src.Signals.Signals import AppQuit
 
 from actions import (
+    MAX_GAIN_DB,
+    MIN_GAIN_DB,
     ClippyingCaptureAction,
     ClippyingFilePlayerAction,
     ClippyingLastClipPlaybackAction,
     ClippyingWsClient,
+    clamp_gain_db,
     notify_plugin_settings_changed,
     start_host_manager,
     stop_daemon_best_effort,
@@ -132,6 +135,41 @@ class Clippying(PluginBase):
             settings = {}
         settings["preview_sink"] = (sink or "").strip()
         self.set_settings(settings)
+
+    def _gain_db(self, key: str) -> float:
+        try:
+            settings = self.get_settings() or {}
+        except Exception:
+            settings = {}
+        return clamp_gain_db(settings.get(key))
+
+    def _set_gain_db(self, key: str, gain_db: float) -> None:
+        try:
+            settings = self.get_settings() or {}
+        except Exception:
+            settings = {}
+        settings[key] = clamp_gain_db(gain_db)
+        self.set_settings(settings)
+        notify_plugin_settings_changed()
+
+    def _gain_row(self, key: str, title: str, subtitle: str) -> Adw.SpinRow:
+        adjustment = Gtk.Adjustment(
+            lower=MIN_GAIN_DB,
+            upper=MAX_GAIN_DB,
+            step_increment=0.5,
+            page_increment=3.0,
+            value=self._gain_db(key),
+        )
+        row = Adw.SpinRow(title=title, subtitle=subtitle, adjustment=adjustment, digits=1)
+
+        def on_value_changed(*_args):
+            value = clamp_gain_db(row.get_value())
+            if value == self._gain_db(key):
+                return
+            self._set_gain_db(key, value)
+
+        row.connect("notify::value", on_value_changed)
+        return row
 
     def _clips_dir(self) -> str:
         try:
@@ -267,6 +305,21 @@ class Clippying(PluginBase):
         layout_row = Adw.ActionRow(title="Latest clip path pattern")
         layout_row.set_subtitle(f"{self._clips_dir()}/<source>/latest.wav")
         group.add(layout_row)
+
+        group.add(
+            self._gain_row(
+                "capture_gain_db",
+                "Capture boost",
+                "Gain applied while buffering the monitor source (loud sources can clip)",
+            )
+        )
+        group.add(
+            self._gain_row(
+                "clip_gain_db",
+                "Trimmer boost",
+                "Boost the trimmer opens with; adjust per clip with its slider",
+            )
+        )
 
         return group
 

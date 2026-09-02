@@ -17,11 +17,19 @@ The plugin includes a Rust binding layer (`clippying_native`) that embeds and ho
   - Plays the deterministic `latest.wav` for that source
   - Flashes when a fresh clip is saved for that source
   - Supports `Play / Stop`, `Play / Restart`, `Play / Overlap`, `Loop / Stop`, and `Hold To Play`
+  - **Volume boost** (-30 to +30 dB) is applied at playback time, leaving the clip file untouched
 
 - Audio File Player
   - Plays a selected file or a random file from a selected folder
   - Can open the Rust trimmer as a range editor for a selected file and store playback start/end times
+  - The trimmer's boost slider is carried back into the action's **Volume boost**
   - Supports output-device selection and the same playback modes as the latest-clip action
+
+## Audio Boost
+
+- Per-action **Volume boost**: applied when the action plays audio (via `paplay --volume`, or an `ffmpeg` `volume` filter when a range is also set)
+- Plugin setting **Capture boost**: sent to the daemon as `gain_db`, boosting audio as it enters the rolling buffer
+- Plugin setting **Trimmer boost**: the boost the trimmer opens with for new clips
 
 ## Requirements
 
@@ -53,5 +61,5 @@ Clean build artifacts:
 ## Notes
 
 - WebSocket URL defaults to `ws://127.0.0.1:17373`.
-- Plugin settings control the clips directory and trimmer preview output.
+- Plugin settings control the clips directory, trimmer preview output, and the capture/trimmer boosts.
 - The plugin continuously heartbeats the API and will attempt to become host if it disappears.

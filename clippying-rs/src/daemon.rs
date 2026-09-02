@@ -22,11 +22,12 @@ use pulse::sample::{Format, Spec};
 use pulse::stream::Direction;
 use psimple::Simple;
 
+use crate::gain::{self, GainCell};
+
 const SAMPLE_RATE: u32 = 48000;
 const CHANNELS: u8 = 2;
 const BUFFER_SECS: usize = 30;
 const BUFFER_SAMPLES: usize = BUFFER_SECS * SAMPLE_RATE as usize * CHANNELS as usize;
-const INPUT_GAIN: f32 = 1.0;
 
 const MANAGER_WS_PORT: u16 = 17373;
 const PID_FILE: &str = "/tmp/clippying.pid";
@@ -40,15 +41,30 @@ pub const LOG_FILE: &str = "/tmp/clippying.log";
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum DaemonRequest {
     #[serde(alias = "start")]
-    Monitor { source: String },
+    Monitor {
+        source: String,
+        /// Capture boost in dB, applied to the rolling buffer as it fills.
+        #[serde(default)]
+        gain_db: Option<f32>,
+    },
     Stop { source: String },
     StopAll,
+    /// Change the capture boost of a running worker. An empty source applies
+    /// to every worker.
+    SetGain {
+        #[serde(default)]
+        source: String,
+        gain_db: f32,
+    },
     Clip {
         source: String,
         #[serde(default)]
         preview_sink: Option<String>,
         #[serde(default)]
         clips_dir: Option<String>,
+        /// Boost the trimmer opens with, in dB (adjustable there).
+        #[serde(default)]
+        gain_db: Option<f32>,
     },
     Status,
     Sources,
@@ -63,6 +79,7 @@ struct DaemonStatus {
     buffer_secs: usize,
     buffered_samples: usize,
     ws_port: u16,
+    gain_db: f32,
     last_clip: Option<ClipSaved>,
 }
 
@@ -76,6 +93,13 @@ struct SourceEntry {
 struct SinkEntry {
     name: String,
     description: String,
+}
+
+/// What a `clip` request asks the spawned trimmer for.
+struct ClipOptions<'a> {
+    preview_sink: Option<&'a str>,
+    clips_dir: Option<&'a str>,
+    gain_db: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,17 +376,22 @@ struct WorkerState {
     stop_requested: Arc<AtomicBool>,
     buffer: Arc<Mutex<VecDeque<i16>>>,
     last_clip: Arc<Mutex<Option<ClipSaved>>>,
+    gain: Arc<GainCell>,
 }
 
 fn start_worker(
     source: &str,
     workers: &Arc<Mutex<HashMap<String, WorkerState>>>,
+    gain_db: Option<f32>,
 ) -> Result<(), String> {
     {
         let Ok(map) = workers.lock() else {
             return Err("worker map lock".to_string());
         };
-        if map.contains_key(source) {
+        if let Some(existing) = map.get(source) {
+            if let Some(db) = gain_db {
+                existing.gain.set_db(db);
+            }
             return Ok(());
         }
     }
@@ -370,11 +399,13 @@ fn start_worker(
     let stop_requested = Arc::new(AtomicBool::new(false));
     let buffer: Arc<Mutex<VecDeque<i16>>> = Arc::new(Mutex::new(VecDeque::with_capacity(BUFFER_SAMPLES)));
     let last_clip: Arc<Mutex<Option<ClipSaved>>> = Arc::new(Mutex::new(None));
+    let gain = Arc::new(GainCell::new(gain_db.unwrap_or(0.0)));
 
     let state = WorkerState {
         stop_requested: stop_requested.clone(),
         buffer: buffer.clone(),
         last_clip: last_clip.clone(),
+        gain: gain.clone(),
     };
 
     {
@@ -421,10 +452,10 @@ fn start_worker(
                 break;
             }
 
+            let linear = gain.linear();
             let Ok(mut b) = buffer.lock() else { break };
             for &sample in &audio_buf {
-                let boosted = (sample as f32 * INPUT_GAIN).clamp(-32768.0, 32767.0) as i16;
-                b.push_back(boosted);
+                b.push_back(gain::apply(sample, linear));
             }
             while b.len() > BUFFER_SAMPLES {
                 b.pop_front();
@@ -444,6 +475,28 @@ fn stop_worker(source: &str, workers: &Arc<Mutex<HashMap<String, WorkerState>>>)
     let Ok(mut map) = workers.lock() else { return Err("worker map lock".to_string()) };
     let Some(w) = map.remove(source) else { return Err("not running".to_string()) };
     w.stop_requested.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+fn set_worker_gain(
+    source: &str,
+    gain_db: f32,
+    workers: &Arc<Mutex<HashMap<String, WorkerState>>>,
+) -> Result<(), String> {
+    let Ok(map) = workers.lock() else { return Err("worker map lock".to_string()) };
+    let source = source.trim();
+
+    if source.is_empty() {
+        for w in map.values() {
+            w.gain.set_db(gain_db);
+        }
+        info!("capture gain set to {:.1} dB (all sources)", gain::clamp_db(gain_db));
+        return Ok(());
+    }
+
+    let Some(w) = map.get(source) else { return Err("not running".to_string()) };
+    w.gain.set_db(gain_db);
+    info!("capture gain set to {:.1} dB (source={})", w.gain.db(), source);
     Ok(())
 }
 
@@ -574,7 +627,7 @@ fn handle_request_bytes(
     };
 
     match req {
-        DaemonRequest::Monitor { source } => match start_worker(&source, workers) {
+        DaemonRequest::Monitor { source, gain_db } => match start_worker(&source, workers, gain_db) {
             Ok(()) => DaemonResponse::Ok,
             Err(message) => DaemonResponse::Error { message },
         },
@@ -586,7 +639,11 @@ fn handle_request_bytes(
             stop_all_workers(workers);
             DaemonResponse::Ok
         }
-        DaemonRequest::Clip { source, preview_sink, clips_dir } => {
+        DaemonRequest::SetGain { source, gain_db } => match set_worker_gain(&source, gain_db, workers) {
+            Ok(()) => DaemonResponse::Ok,
+            Err(message) => DaemonResponse::Error { message },
+        },
+        DaemonRequest::Clip { source, preview_sink, clips_dir, gain_db } => {
             info!("clip requested (source={})", source);
             let worker = {
                 let Ok(map) = workers.lock() else {
@@ -605,8 +662,11 @@ fn handle_request_bytes(
                 &w.last_clip,
                 ws_clients,
                 exe_path,
-                preview_sink.as_deref(),
-                clips_dir.as_deref(),
+                ClipOptions {
+                    preview_sink: preview_sink.as_deref(),
+                    clips_dir: clips_dir.as_deref(),
+                    gain_db,
+                },
             );
             DaemonResponse::Ok
         }
@@ -617,7 +677,7 @@ fn handle_request_bytes(
                 };
 
                 map.iter()
-                    .map(|(source, w)| daemon_status(source, &w.buffer, &w.last_clip))
+                    .map(|(source, w)| daemon_status(source, w))
                     .collect::<Vec<_>>()
             };
 
@@ -640,13 +700,9 @@ fn handle_request_bytes(
     }
 }
 
-fn daemon_status(
-    source: &str,
-    buffer: &Arc<Mutex<VecDeque<i16>>>,
-    last_clip: &Arc<Mutex<Option<ClipSaved>>>,
-) -> DaemonStatus {
-    let buffered_samples = buffer.lock().map(|b| b.len()).unwrap_or(0);
-    let last_clip = last_clip.lock().ok().and_then(|c| c.clone());
+fn daemon_status(source: &str, worker: &WorkerState) -> DaemonStatus {
+    let buffered_samples = worker.buffer.lock().map(|b| b.len()).unwrap_or(0);
+    let last_clip = worker.last_clip.lock().ok().and_then(|c| c.clone());
     DaemonStatus {
         source: source.to_string(),
         sample_rate: SAMPLE_RATE,
@@ -654,6 +710,7 @@ fn daemon_status(
         buffer_secs: BUFFER_SECS,
         buffered_samples,
         ws_port: MANAGER_WS_PORT,
+        gain_db: worker.gain.db(),
         last_clip,
     }
 }
@@ -664,8 +721,7 @@ fn clip_buffer(
     last_clip: &Arc<Mutex<Option<ClipSaved>>>,
     ws_clients: &Arc<Mutex<Vec<mpsc::Sender<String>>>>,
     exe_path: &str,
-    preview_sink: Option<&str>,
-    clips_dir: Option<&str>,
+    options: ClipOptions<'_>,
 ) {
     let mono: Vec<i16> = {
         let b = match buffer.lock() {
@@ -686,12 +742,15 @@ fn clip_buffer(
         .arg(SAMPLE_RATE.to_string())
         .arg("1"); // mono
 
-    if let Some(sink) = preview_sink.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(sink) = options.preview_sink.map(|s| s.trim()).filter(|s| !s.is_empty()) {
         cmd.env("PULSE_SINK", sink);
         cmd.arg("--preview-sink").arg(sink);
     }
-    if let Some(dir) = clips_dir.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(dir) = options.clips_dir.map(|s| s.trim()).filter(|s| !s.is_empty()) {
         cmd.arg("--clips-dir").arg(dir);
+    }
+    if let Some(db) = options.gain_db.map(gain::clamp_db).filter(|db| *db != 0.0) {
+        cmd.arg("--gain").arg(format!("{db}"));
     }
     cmd.arg("--source").arg(source);
 
@@ -761,4 +820,64 @@ fn clip_buffer(
             broadcast_ws(&ws_clients_wait, &canceled.to_string());
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> DaemonRequest {
+        serde_json::from_str(json).expect("request should parse")
+    }
+
+    #[test]
+    fn monitor_gain_is_optional() {
+        assert!(matches!(
+            parse(r#"{"cmd":"monitor","source":"mon"}"#),
+            DaemonRequest::Monitor { gain_db: None, .. }
+        ));
+        assert!(matches!(
+            parse(r#"{"cmd":"monitor","source":"mon","gain_db":6.0}"#),
+            DaemonRequest::Monitor { gain_db: Some(db), .. } if db == 6.0
+        ));
+    }
+
+    #[test]
+    fn clip_carries_gain() {
+        assert!(matches!(
+            parse(r#"{"cmd":"clip","source":"mon","gain_db":-3.5}"#),
+            DaemonRequest::Clip { gain_db: Some(db), .. } if db == -3.5
+        ));
+    }
+
+    #[test]
+    fn set_gain_defaults_to_all_sources() {
+        assert!(matches!(
+            parse(r#"{"cmd":"set_gain","gain_db":12.0}"#),
+            DaemonRequest::SetGain { ref source, gain_db } if source.is_empty() && gain_db == 12.0
+        ));
+    }
+
+    #[test]
+    fn set_gain_updates_running_workers() {
+        let workers: Arc<Mutex<HashMap<String, WorkerState>>> = Arc::new(Mutex::new(HashMap::new()));
+        workers.lock().unwrap().insert(
+            "mon".to_string(),
+            WorkerState {
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                buffer: Arc::new(Mutex::new(VecDeque::new())),
+                last_clip: Arc::new(Mutex::new(None)),
+                gain: Arc::new(GainCell::new(0.0)),
+            },
+        );
+
+        set_worker_gain("mon", 9.0, &workers).expect("known source");
+        assert_eq!(workers.lock().unwrap()["mon"].gain.db(), 9.0);
+
+        // An empty source is a broadcast, and gains stay inside the bounds.
+        set_worker_gain("", 500.0, &workers).expect("broadcast");
+        assert_eq!(workers.lock().unwrap()["mon"].gain.db(), gain::MAX_GAIN_DB);
+
+        assert!(set_worker_gain("missing", 1.0, &workers).is_err());
+    }
 }

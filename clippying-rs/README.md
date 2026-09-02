@@ -96,7 +96,28 @@ Response:
 Request:
 
 ```json
-{"cmd":"monitor","source":"pipeweaver_voice.monitor"}
+{"cmd":"monitor","source":"pipeweaver_voice.monitor","gain_db":0}
+```
+
+`gain_db` is optional (default `0`, range `-30` to `+30`) and boosts audio as it
+enters the rolling buffer. Sending `monitor` for a source that is already
+running just updates its gain.
+
+Response:
+
+```json
+{"type":"ok"}
+```
+
+### Request: set_gain
+
+Change the capture boost of running workers without restarting them. An empty
+or omitted `source` applies the gain to every worker.
+
+Request:
+
+```json
+{"cmd":"set_gain","source":"pipeweaver_voice.monitor","gain_db":6}
 ```
 
 Response:
@@ -126,6 +147,7 @@ Response:
       "buffer_secs":30,
       "buffered_samples":2880000,
       "ws_port":17373,
+      "gain_db":0.0,
       "last_clip":{
         "path":"/home/user/clips/clip_1765589360.wav",
         "start_secs":15.244,
@@ -141,7 +163,7 @@ Response:
 Request:
 
 ```json
-{"cmd":"clip","source":"pipeweaver_voice.monitor"}
+{"cmd":"clip","source":"pipeweaver_voice.monitor","gain_db":0}
 ```
 
 Response:
@@ -150,7 +172,9 @@ Response:
 {"type":"ok"}
 ```
 
-This spawns the trimmer UI and streams PCM to it.
+This spawns the trimmer UI and streams PCM to it. `gain_db` is the boost the
+trimmer opens with; it stays adjustable there with the boost slider, and the
+value that is finally used is reported back in `clip_saved`.
 
 #### Push event: clip_saved
 
@@ -162,8 +186,26 @@ When you save a clip in the trimmer UI, the daemon broadcasts a push event to **
   "source": "pipeweaver_voice.monitor",
   "path": "/home/user/clips/clip_1765589360.wav",
   "start_secs": 15.244000434875488,
-  "end_secs": 18.486665725708008
+  "end_secs": 18.486665725708008,
+  "gain_db": 6.0
 }
+```
+
+## Trimmer boost
+
+The trimmer window has a boost slider (-30 to +30 dB) next to the transport
+buttons:
+
+- The waveform rescales instantly and turns red where the boost clips, with a
+  `CLIP` badge when the current selection would hit the ceiling
+- Preview playback follows the slider while it is playing
+- The saved WAV is written with the boost baked in
+- Clicking the dB readout returns to 0 dB
+
+It can also be set from the command line when driving the trimmer directly:
+
+```bash
+clippying --stdin-pcm 48000 1 --gain 6 < audio.pcm
 ```
 
 ### Request: stop

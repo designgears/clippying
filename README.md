@@ -73,9 +73,10 @@ WebSocket endpoint: `ws://127.0.0.1:17373/`
 Common requests:
 
 - `{"cmd":"sources"}` - list available monitor sources
-- `{"cmd":"monitor","source":"..."}` - start monitoring source
-- `{"cmd":"status"}` - get monitoring/buffer status
-- `{"cmd":"clip","source":"..."}` - open trimmer and create clip
+- `{"cmd":"monitor","source":"...","gain_db":0}` - start monitoring source (optional capture boost)
+- `{"cmd":"set_gain","source":"...","gain_db":6}` - change capture boost live (empty source = all)
+- `{"cmd":"status"}` - get monitoring/buffer status (includes `gain_db`)
+- `{"cmd":"clip","source":"...","gain_db":0}` - open trimmer and create clip
 - `{"cmd":"stop","source":"..."}` - stop one source
 - `{"cmd":"stop_all"}` - stop all monitored sources
 
@@ -92,6 +93,14 @@ The plugin provides a `Clip Button` action:
 - Auto-enables monitoring for selected source
 - Short press triggers `clip` and waits for matching `clip_saved`
 - Long press replays the last saved clip
+
+## Audio Boost
+
+Gain is expressed in dB (range -30 to +30) and can be applied at every stage:
+
+- **Capture** - plugin setting *Capture boost*, or `monitor`/`set_gain`; boosts audio as it enters the rolling buffer
+- **Trimmer** - the boost slider in the trimmer window; scales the waveform, the preview, and the saved WAV, and warns with `CLIP` when the selection would hit the ceiling. Plugin setting *Trimmer boost* sets its starting value
+- **Playback** - per-action *Volume boost* on the latest-clip and file-player actions; applied when the clip is played back, leaving the file untouched
 
 ## Detailed Component Docs
 
